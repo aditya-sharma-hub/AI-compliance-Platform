@@ -447,6 +447,78 @@ header {
     color: var(--text-secondary);
 }
 
+/* Auditor Project Filters */
+.project-filter-bar {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    margin: 1.25rem 0 1.5rem;
+}
+
+.project-filter-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.7rem 1rem;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: var(--transition-smooth);
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.project-filter-pill span {
+    min-width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0.4rem;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
+    font-size: 0.75rem;
+}
+
+.project-filter-pill.active {
+    background: rgba(255, 230, 0, 0.12);
+    border-color: rgba(255, 230, 0, 0.28);
+    color: var(--primary);
+}
+
+.project-filter-pill.active span {
+    background: rgba(255, 230, 0, 0.22);
+    color: var(--primary);
+}
+
+.project-section {
+    margin-bottom: 1.5rem;
+}
+
+.project-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.9rem;
+    color: var(--text-secondary);
+}
+
+.project-section-header h4 {
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 700;
+}
+
+.project-section-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+}
+
 /* Questionnaire Split View */
 .quiz-container {
     display: grid;
