@@ -357,6 +357,7 @@ const INITIAL_PROJECTS = [
         desc: "An integrated AI surveillance and command platform for metropolitan police operations, processing 40,000+ live camera feeds using computer vision-based threat detection, crowd analytics, and autonomous UAV surveillance across 200+ urban intersections.",
         frameworks: ["EU AI Act", "NIST AI RMF", "DPDP", "MeitY Guidelines", "ISO 42001"],
         status: "Submitted — Awaiting Auditor Review",
+        isSeedDemo: true,
         auditeeEmail: "arjun.mehta@govtech.in",
         auditeeProfile: {
             designation: "Technology Director",
@@ -496,7 +497,7 @@ class AppStateManager {
             designation,
             role,
             mobile,
-            onboarded: false, // reset onboarding so they can run through the walkthrough
+            onboarded: role === "auditor", // auditors can enter the workspace immediately; auditees still complete onboarding
             profile: null
         };
         
@@ -527,7 +528,7 @@ class AppStateManager {
         if (!user.onboarded) {
             this.activeView = user.role === "auditor" ? "onboarding-auditor" : "onboarding-auditee";
         } else {
-            this.activeView = "welcome";
+            this.activeView = user.role === "auditor" ? "ongoing-projects" : "welcome";
         }
         
         this.saveState();
@@ -716,8 +717,8 @@ function renderSidebarNav() {
     navNewProject.style.display = "flex";
     
     if (State.currentUser && State.currentUser.role === "auditor") {
-        // Count ALL projects the auditor can see (matches renderOngoingProjectsView which shows all projects)
-        const ongoingCount = State.projects.length;
+        // Count only active submitted projects so reviewed items do not keep the ongoing badge inflated.
+        const ongoingCount = State.projects.filter(p => !p.isSeedDemo && (p.status === "Submitted — Awaiting Auditor Review" || p.status === "Under Assessment")).length;
         if (ongoingCount > 0) {
             badgeEl.textContent = ongoingCount;
             badgeEl.style.display = "inline-block";
@@ -1133,6 +1134,17 @@ function renderWelcomeView() {
 
 let selectedUploadedFile = null;
 let currentProjectDocs = [];
+let deleteConfirmationProjectId = null;
+let deleteConfirmationTimeoutId = null;
+
+function resetProjectDeleteConfirmation() {
+    if (deleteConfirmationTimeoutId) {
+        clearTimeout(deleteConfirmationTimeoutId);
+        deleteConfirmationTimeoutId = null;
+    }
+
+    deleteConfirmationProjectId = null;
+}
 
 function updateUploadFrameworksDropdown() {
     const checkboxes = document.querySelectorAll('input[name="proj-frameworks"]:checked');
@@ -1405,15 +1417,17 @@ function submitNewProject(event) {
 
 function renderOngoingProjectsView() {
     const grid = document.getElementById("projects-grid-content");
-    let filteredProjects = [];
+    let ongoingProjects = [];
+    let reviewedProjects = [];
     
     if (State.currentUser.role === "auditor") {
-        filteredProjects = State.projects;
+        ongoingProjects = State.projects.filter(p => p.status === "Submitted — Awaiting Auditor Review" || p.status === "Under Assessment");
+        reviewedProjects = State.projects.filter(p => p.status === "Reviewed");
     } else {
-        filteredProjects = State.projects.filter(p => p.auditeeEmail === State.currentUser.email);
+        ongoingProjects = State.projects.filter(p => p.auditeeEmail === State.currentUser.email);
     }
-    
-    if (filteredProjects.length === 0) {
+
+    if (State.currentUser.role === "auditee" && ongoingProjects.length === 0) {
         grid.innerHTML = `
             <div class="glass-panel" style="grid-column: 1 / -1; padding: 3rem; text-align: center; color: var(--text-muted);">
                 No ongoing projects found.
@@ -1421,15 +1435,23 @@ function renderOngoingProjectsView() {
         `;
         return;
     }
-    
-    let cardsHtml = "";
-    filteredProjects.forEach(proj => {
+
+    if (State.currentUser.role === "auditor" && ongoingProjects.length === 0 && reviewedProjects.length === 0) {
+        grid.innerHTML = `
+            <div class="glass-panel" style="grid-column: 1 / -1; padding: 3rem; text-align: center; color: var(--text-muted);">
+                No projects available.
+            </div>
+        `;
+        return;
+    }
+
+    const renderProjectCard = (proj) => {
         let badgeClass = "draft";
         if (proj.status === "Submitted — Awaiting Auditor Review") badgeClass = "submitted";
         if (proj.status === "Under Assessment") badgeClass = "submitted";
         if (proj.status === "Reviewed") badgeClass = "reviewed";
-        
-        cardsHtml += `
+
+        return `
             <div class="project-card" onclick="viewProjectDetail('${proj.id}')">
                 <div class="project-card-title">${proj.title}</div>
                 <div class="project-card-meta">Case ID: ${proj.id} | Domain: ${proj.domain}</div>
@@ -1439,11 +1461,61 @@ function renderOngoingProjectsView() {
                 </div>
             </div>
         `;
-    });
-    grid.innerHTML = cardsHtml;
+    };
+
+    if (State.currentUser.role === "auditor") {
+        grid.innerHTML = `
+            <div class="project-filter-bar">
+                <button class="project-filter-pill active" data-project-filter="ongoing">Ongoing Projects <span>${ongoingProjects.length}</span></button>
+                <button class="project-filter-pill" data-project-filter="reviewed">Reviewed Projects <span>${reviewedProjects.length}</span></button>
+            </div>
+            <div class="project-section" data-project-section="ongoing">
+                <div class="project-section-header">
+                    <h4>Ongoing Projects</h4>
+                    <span>${ongoingProjects.length} active</span>
+                </div>
+                <div class="project-section-grid">
+                    ${ongoingProjects.length > 0 ? ongoingProjects.map(renderProjectCard).join("") : `<div class="glass-panel" style="grid-column: 1 / -1; padding: 2rem; text-align: center; color: var(--text-muted);">No ongoing projects.</div>`}
+                </div>
+            </div>
+            <div class="project-section" data-project-section="reviewed">
+                <div class="project-section-header">
+                    <h4>Reviewed Projects</h4>
+                    <span>${reviewedProjects.length} reviewed</span>
+                </div>
+                <div class="project-section-grid">
+                    ${reviewedProjects.length > 0 ? reviewedProjects.map(renderProjectCard).join("") : `<div class="glass-panel" style="grid-column: 1 / -1; padding: 2rem; text-align: center; color: var(--text-muted);">No reviewed projects yet.</div>`}
+                </div>
+            </div>
+        `;
+
+        const filterButtons = grid.querySelectorAll("[data-project-filter]");
+        const sections = grid.querySelectorAll("[data-project-section]");
+        filterButtons.forEach(button => {
+            button.addEventListener("click", () => {
+                const filter = button.getAttribute("data-project-filter");
+                filterButtons.forEach(btn => btn.classList.toggle("active", btn === button));
+                sections.forEach(section => {
+                    section.style.display = section.getAttribute("data-project-section") === filter ? "block" : "none";
+                });
+            });
+        });
+
+        sections.forEach(section => {
+            section.style.display = section.getAttribute("data-project-section") === "ongoing" ? "block" : "none";
+        });
+        return;
+    }
+
+    grid.innerHTML = `
+        <div class="project-section-grid">
+            ${ongoingProjects.map(renderProjectCard).join("")}
+        </div>
+    `;
 }
 
 function viewProjectDetail(projectId) {
+    resetProjectDeleteConfirmation();
     State.activeProjectId = projectId;
     State.saveState();
     navigateTo("project-detail");
@@ -1456,6 +1528,7 @@ function viewProjectDetail(projectId) {
 function renderProjectDetailView() {
     const proj = State.getActiveProject();
     if (!proj) {
+        resetProjectDeleteConfirmation();
         navigateTo("ongoing-projects");
         return;
     }
@@ -1536,6 +1609,15 @@ function renderProjectDetailView() {
                 <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
                 <button class="btn btn-primary" onclick="navigateTo('compliance-dashboard')">View Compliance Dashboard</button>
             `;
+        } else if (proj.auditeeEmail === State.currentUser.email) {
+            const isDeleteArmed = deleteConfirmationProjectId === proj.id;
+            actionsBox.innerHTML = `
+                <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
+                <button class="btn btn-danger" onclick="handleProjectDeleteRequest('${proj.id}')">${isDeleteArmed ? 'Click again to delete forever' : 'Delete Project'}</button>
+                <div style="font-size:0.8rem; color:${isDeleteArmed ? 'var(--danger)' : 'var(--text-muted)'}; line-height:1.4; max-width: 320px;">
+                    ${isDeleteArmed ? 'Final click will permanently remove this project from your auditee workspace.' : 'Deletion is only available to the linked auditee and requires a second confirmation click.'}
+                </div>
+            `;
         } else {
             actionsBox.innerHTML = `
                 <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
@@ -1545,6 +1627,64 @@ function renderProjectDetailView() {
             `;
         }
     }
+}
+
+function handleProjectDeleteRequest(projectId) {
+    const proj = State.projects.find(p => p.id === projectId);
+    if (!proj) {
+        resetProjectDeleteConfirmation();
+        showToast("Project could not be found.", "error");
+        navigateTo("ongoing-projects");
+        return;
+    }
+
+    if (!State.currentUser || State.currentUser.role !== "auditee") {
+        resetProjectDeleteConfirmation();
+        showToast("Only auditees can delete their own projects.", "error");
+        return;
+    }
+
+    if (proj.auditeeEmail !== State.currentUser.email) {
+        resetProjectDeleteConfirmation();
+        showToast("You can only delete projects linked to your auditee account.", "error");
+        return;
+    }
+
+    if (proj.status === "Reviewed") {
+        resetProjectDeleteConfirmation();
+        showToast("Reviewed projects cannot be deleted.", "warning");
+        return;
+    }
+
+    if (deleteConfirmationProjectId === projectId) {
+        State.projects = State.projects.filter(p => p.id !== projectId);
+
+        if (State.activeProjectId === projectId) {
+            State.activeProjectId = null;
+        }
+
+        State.saveState();
+        resetProjectDeleteConfirmation();
+        renderSidebarNav();
+        showToast("Project deleted successfully.", "success");
+        navigateTo("ongoing-projects");
+        return;
+    }
+
+    resetProjectDeleteConfirmation();
+    deleteConfirmationProjectId = projectId;
+
+    deleteConfirmationTimeoutId = setTimeout(() => {
+        if (deleteConfirmationProjectId === projectId) {
+            resetProjectDeleteConfirmation();
+            if (State.activeView === "project-detail" && State.activeProjectId === projectId) {
+                renderProjectDetailView();
+            }
+        }
+    }, 6000);
+
+    showToast("Click Delete Project again within 6 seconds to permanently remove it.", "warning");
+    renderProjectDetailView();
 }
 
 function simulateDownload(filename) {
