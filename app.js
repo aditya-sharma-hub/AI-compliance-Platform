@@ -1403,6 +1403,9 @@ async function handleGoogleLogin() {
     try {
         const { data, error } = await _supabase.auth.signInWithOAuth({
             provider: 'google',
+            options: {
+                redirectTo: window.location.origin
+            }
         });
         if (error) {
             showToast("Google login failed: " + error.message, "error");
