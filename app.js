@@ -1782,20 +1782,7 @@ function initNewProjectForm() {
     renderUploadedDocsTable();
 }
 
-function updateUploadFrameworksDropdown() {
-    const selectedFrameworks = Array.from(document.querySelectorAll('input[name="proj-frameworks"]:checked')).map(cb => cb.value);
-    const selectEl = document.getElementById("upload-framework-select");
-    if (!selectEl) return;
-    
-    // Always keep the placeholder
-    let optionsHtml = '<option value="" disabled selected>Select Framework Tag...</option>';
-    
-    selectedFrameworks.forEach(fw => {
-        optionsHtml += `<option value="${fw}">${fw}</option>`;
-    });
-    
-    selectEl.innerHTML = optionsHtml;
-}
+
 
 function addCustomFramework() {
     const inputEl = document.getElementById("new-custom-framework");
