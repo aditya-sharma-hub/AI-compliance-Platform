@@ -645,6 +645,38 @@ async function syncWithSupabase() {
                     }
                 });
                 
+                const localProjects = State.projects || [];
+                const localProj = localProjects.find(lp => lp.id === p.id);
+                const isSubmitted = p.status === "Reviewed";
+                
+                const mergeAnswers = (local, db, submitted) => {
+                    if (submitted) return { ...local, ...db };
+                    const merged = { ...db };
+                    for (const key in local) {
+                        const localAns = local[key];
+                        if (localAns) {
+                            const localVal = localAns.value || 'unanswered';
+                            const localCom = localAns.comment || '';
+                            if (localVal !== 'unanswered' || localCom !== '') {
+                                merged[key] = localAns;
+                            }
+                        }
+                    }
+                    return merged;
+                };
+
+                const finalAzAnswers = localProj ? mergeAnswers(localProj.azAnswers || {}, azAnswers, isSubmitted) : azAnswers;
+                const finalComplianceAnswers = localProj ? mergeAnswers(localProj.complianceAnswers || {}, complianceAnswers, isSubmitted) : complianceAnswers;
+
+                let auditeeProfile = p.auditee_profile;
+                if (localProj && localProj.auditeeProfile) {
+                    if (!auditeeProfile) {
+                        auditeeProfile = localProj.auditeeProfile;
+                    } else if (localProj.auditeeProfile.auditorNotes && !auditeeProfile.auditorNotes) {
+                        auditeeProfile.auditorNotes = localProj.auditeeProfile.auditorNotes;
+                    }
+                }
+
                 projectsMapped.push({
                     id: p.id,
                     title: p.title,
@@ -653,11 +685,11 @@ async function syncWithSupabase() {
                     frameworks: p.frameworks,
                     status: p.status,
                     auditeeEmail: p.auditee_email,
-                    auditeeProfile: p.auditee_profile,
+                    auditeeProfile: auditeeProfile,
                     auditorEmail: p.auditor_email,
                     documents: documentsMapped,
-                    azAnswers,
-                    complianceAnswers,
+                    azAnswers: finalAzAnswers,
+                    complianceAnswers: finalComplianceAnswers,
                     azSubmitted: p.az_submitted,
                     complianceSubmitted: p.compliance_submitted
                 });
@@ -672,28 +704,6 @@ async function syncWithSupabase() {
                 }
             }
             State.projects = mergedProjects;
-        }
-        
-        // Fetch Notifications
-        if (!State.currentUser) return; // guard before next await
-        const { data: dbNotifications } = await _supabase
-            .from('notifications')
-            .select('*')
-            .eq('receiver_email', State.currentUser.email);
-            
-        if (dbNotifications) {
-            State.notifications = dbNotifications.map(n => ({
-                id: n.id,
-                projectId: n.project_id,
-                projectTitle: n.project_title,
-                senderEmail: n.sender_email,
-                senderName: n.sender_name,
-                receiverEmail: n.receiver_email,
-                message: n.message,
-                type: n.type,
-                status: n.status,
-                timestamp: n.timestamp
-            }));
         }
         
         // Fetch Private Documents
@@ -851,6 +861,7 @@ class AppStateManager {
         this.currentUser = safeGetJSON("ey_current_user", null);
         this.activeProjectId = safeStorage.getItem("ey_active_project_id") || null;
         this.activeView = safeStorage.getItem("ey_active_view") || "welcome";
+        this.currentProjectStep = parseInt(safeStorage.getItem("ey_current_project_step") || "1");
         this.viewHistory = safeGetJSON("ey_view_history", []);
         this.privateDocuments = safeGetJSON("ey_private_documents", {});
         
@@ -866,6 +877,7 @@ class AppStateManager {
         safeStorage.setItem("ey_projects", JSON.stringify(this.projects));
         safeStorage.setItem("ey_current_user", JSON.stringify(this.currentUser));
         safeStorage.setItem("ey_active_view", this.activeView);
+        safeStorage.setItem("ey_current_project_step", this.currentProjectStep ? String(this.currentProjectStep) : "1");
         safeStorage.setItem("ey_view_history", JSON.stringify(this.viewHistory));
         safeStorage.setItem("ey_private_documents", JSON.stringify(this.privateDocuments));
         if (this.activeProjectId) {
@@ -933,6 +945,7 @@ class AppStateManager {
     logout() {
         this.currentUser = null;
         this.activeProjectId = null;
+        this.currentProjectStep = 1;
         this.activeView = "auth-section";
         this.viewHistory = [];
         this.saveState();
@@ -1025,13 +1038,40 @@ function navigateTo(viewName, saveToHistory = true) {
         return;
     }
 
-
-
     if (saveToHistory && State.activeView && State.activeView !== viewName) {
         // Avoid duplicate consecutive history entries
         if (State.viewHistory.length === 0 || State.viewHistory[State.viewHistory.length - 1] !== State.activeView) {
             State.viewHistory.push(State.activeView);
         }
+    }
+
+    const projectViews = ["project-detail", "az-assessment", "compliance-questionnaire", "compliance-dashboard", "auditor-review"];
+    if (projectViews.includes(viewName) && State.activeProjectId) {
+        let step = 1;
+        if (viewName === "project-detail") {
+            step = (State.currentProjectStep >= 1 && State.currentProjectStep <= 3) ? State.currentProjectStep : 1;
+        } else if (viewName === "az-assessment") {
+            step = 4;
+        } else if (viewName === "compliance-questionnaire") {
+            step = 5;
+        } else if (viewName === "auditor-review") {
+            step = 6;
+        } else if (viewName === "compliance-dashboard") {
+            step = 7;
+        }
+        
+        State.activeView = viewName;
+        State.currentProjectStep = step;
+        State.saveState();
+        
+        goToProjectStep(step);
+        return;
+    }
+
+    if (!projectViews.includes(viewName)) {
+        State.activeProjectId = null;
+        State.currentProjectStep = 1;
+        State.saveState();
     }
 
     State.activeView = viewName;
@@ -1046,6 +1086,17 @@ async function showView(viewName) {
     // and a user is logged in. Avoids cascading async calls that reset the UI.
     if (viewName !== "auth-section" && State.currentUser) {
         void syncWithSupabase();
+    }
+
+    // Manage stepper visibility
+    const projectViews = ["project-detail", "az-assessment", "compliance-questionnaire", "compliance-dashboard", "auditor-review"];
+    const stepper = document.getElementById("project-stepper");
+    if (stepper) {
+        if (projectViews.includes(viewName) && State.activeProjectId) {
+            stepper.style.display = "flex";
+        } else {
+            stepper.style.display = "none";
+        }
     }
 
     // Hide auth section and main layout first
@@ -1118,6 +1169,9 @@ async function showView(viewName) {
         // Show Add Auditee in sidebar
         document.getElementById("add-auditee-widget").style.display = "block";
         renderComplianceQuestionnaireView();
+    } else if (viewName === "auditor-review") {
+        document.getElementById("auditor-review-view").style.display = "block";
+        renderAuditorReviewView();
     } else if (viewName === "compliance-dashboard") {
         document.getElementById("compliance-dashboard-view").style.display = "block";
         renderComplianceDashboardView();
@@ -1672,47 +1726,6 @@ function renderWelcomeView() {
             </div>
         `;
     }
-
-    // Pending Requests list for Auditees
-    const welcomePanel = document.getElementById("welcome-view");
-    if (welcomePanel) {
-        const oldRequests = document.getElementById("welcome-pending-requests");
-        if (oldRequests) oldRequests.remove();
-
-        if (State.currentUser.role === "auditee") {
-            const pendingRequests = State.notifications.filter(n => n.receiverEmail === State.currentUser.email && n.status === "pending" && n.type === "document_request");
-            
-            if (pendingRequests.length > 0) {
-                const requestsDiv = document.createElement("div");
-                requestsDiv.id = "welcome-pending-requests";
-                requestsDiv.className = "glass-panel";
-                requestsDiv.style.cssText = "margin-top: 1.5rem; padding: 1.5rem; border-color: var(--warning-glow); text-align: left;";
-                
-                requestsDiv.innerHTML = `
-                    <h4 style="color: var(--warning); margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem;">
-                        ⚠️ Pending Requests (${pendingRequests.length})
-                    </h4>
-                    <div style="display: flex; flex-direction: column; gap: 0.6rem;">
-                        ${pendingRequests.map(req => `
-                            <div style="padding: 0.75rem; background: rgba(255,193,7,0.02); border: 1px solid var(--warning-glow); border-radius: 6px; display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;">
-                                <div>
-                                    <div style="font-weight: 600; color: var(--text-primary);">${req.message}</div>
-                                    <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 0.2rem;">Timestamp: ${req.timestamp}</div>
-                                </div>
-                                <div style="display: flex; gap: 0.5rem;">
-                                    <button class="btn btn-secondary btn-sm" onclick="uploadForRequest('${req.projectId}', '${req.id}')">View Request</button>
-                                    <button class="btn btn-primary btn-sm" onclick="uploadForRequest('${req.projectId}', '${req.id}')">Upload Documents</button>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                `;
-                welcomePanel.appendChild(requestsDiv);
-            }
-        }
-    }
-
-
 }
 
 // ==========================================================================
@@ -2124,31 +2137,6 @@ function submitNewProject(event) {
                             .eq('name', doc.name)
                             .eq('owner_email', State.currentUser.email.toLowerCase().trim());
                     }
-
-                    // Create notification for all auditors
-                    const { data: auditors } = await _supabase
-                        .from('users')
-                        .select('email')
-                        .eq('role', 'auditor');
-                        
-                    if (auditors) {
-                        for (const aud of auditors) {
-                            const notifId = String(Math.floor(10000 + Math.random() * 90000));
-                            const notif = {
-                                id: notifId,
-                                project_id: newProj.id,
-                                project_title: newProj.title,
-                                sender_email: State.currentUser.email,
-                                sender_name: State.currentUser.fullname,
-                                receiver_email: aud.email,
-                                message: `New compliance project submitted: ${newProj.title} (Case ID: ${newProj.id})`,
-                                type: "general",
-                                status: "unread",
-                                timestamp: new Date().toISOString().substring(0, 16).replace('T', ' ')
-                            };
-                            await _supabase.from('notifications').insert([notif]);
-                        }
-                    }
                 }
             } else {
                 showToast("_supabase not connected — saving locally.", "info");
@@ -2300,16 +2288,257 @@ function renderOngoingProjectsView() {
     }
 }
 
+function toggleAssessmentInputs(containerId, isEditable) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.querySelectorAll("select, textarea, input").forEach(el => {
+        if (el.id !== "btn-az-save-draft" && el.id !== "btn-az-submit" && el.id !== "btn-comp-save-draft" && el.id !== "btn-comp-submit") {
+            el.disabled = !isEditable;
+            if (!isEditable) {
+                el.style.opacity = "0.75";
+                el.style.cursor = "not-allowed";
+            } else {
+                el.style.opacity = "";
+                el.style.cursor = "";
+            }
+        }
+    });
+}
+
+async function goToProjectStep(stepNumber) {
+    const proj = State.getActiveProject();
+    if (!proj) {
+        navigateTo("ongoing-projects");
+        return;
+    }
+
+    if (stepNumber >= 1 && stepNumber <= 3) {
+        State.activeView = "project-detail";
+    } else if (stepNumber === 4) {
+        State.activeView = "az-assessment";
+    } else if (stepNumber === 5) {
+        State.activeView = "compliance-questionnaire";
+    } else if (stepNumber === 6) {
+        State.activeView = "auditor-review";
+    } else if (stepNumber === 7) {
+        State.activeView = "compliance-dashboard";
+    }
+    State.currentProjectStep = stepNumber;
+    State.saveState();
+
+    // Hide all view panels first
+    document.querySelectorAll(".view-panel").forEach(panel => {
+        panel.style.display = "none";
+    });
+
+    // Reset active nav link class
+    document.querySelectorAll(".nav-link").forEach(link => {
+        link.classList.remove("active");
+    });
+    
+    // Hide Sidebar Add Auditee widget by default
+    document.getElementById("add-auditee-widget").style.display = "none";
+
+    // Manage global top navigation back button visibility
+    const topNavBar = document.getElementById("global-top-nav-bar");
+    if (topNavBar) {
+        topNavBar.style.display = "flex";
+    }
+
+    // Display Main Dashboard Layout
+    document.getElementById("main-layout").style.display = "grid";
+    renderUserBadge();
+    renderSidebarNav();
+    renderDraftResumeBanner();
+
+    // Show horizontal stepper
+    const stepper = document.getElementById("project-stepper");
+    if (stepper) {
+        stepper.style.display = "flex";
+        stepper.querySelectorAll(".step").forEach(s => {
+            const sNum = parseInt(s.getAttribute("data-step"));
+            s.classList.remove("active", "completed");
+            if (sNum === stepNumber) {
+                s.classList.add("active");
+            } else if (sNum < stepNumber) {
+                s.classList.add("completed");
+            }
+        });
+        stepper.querySelectorAll(".step-line").forEach((l, idx) => {
+            l.classList.remove("completed");
+            if (idx < stepNumber - 1) {
+                l.classList.add("completed");
+            }
+        });
+    }
+
+    // Manage subviews within project details
+    const overviewSub = document.getElementById("project-overview-subview");
+    const auditeeSub = document.getElementById("project-auditee-subview");
+    const documentsSub = document.getElementById("project-documents-subview");
+    
+    if (overviewSub) overviewSub.style.display = "none";
+    if (auditeeSub) auditeeSub.style.display = "none";
+    if (documentsSub) documentsSub.style.display = "none";
+
+    const isAuditor = State.currentUser.role === "auditor";
+
+    if (stepNumber === 1) {
+        document.getElementById("project-detail-view").style.display = "block";
+        if (overviewSub) overviewSub.style.display = "block";
+        renderProjectDetailView();
+    } else if (stepNumber === 2) {
+        document.getElementById("project-detail-view").style.display = "block";
+        if (auditeeSub) auditeeSub.style.display = "block";
+        renderProjectDetailView();
+    } else if (stepNumber === 3) {
+        document.getElementById("project-detail-view").style.display = "block";
+        if (documentsSub) documentsSub.style.display = "block";
+        renderProjectDetailView();
+    } else if (stepNumber === 4) {
+        document.getElementById("az-assessment-view").style.display = "block";
+        if (isAuditor) document.getElementById("add-auditee-widget").style.display = "block";
+        renderAZAssessmentView();
+        toggleAssessmentInputs("az-assessment-sheet", isAuditor && !proj.azSubmitted);
+    } else if (stepNumber === 5) {
+        document.getElementById("compliance-questionnaire-view").style.display = "block";
+        if (isAuditor) document.getElementById("add-auditee-widget").style.display = "block";
+        renderComplianceQuestionnaireView();
+        toggleAssessmentInputs("compliance-assessment-sheet", isAuditor && !proj.complianceSubmitted);
+    } else if (stepNumber === 6) {
+        document.getElementById("auditor-review-view").style.display = "block";
+        renderAuditorReviewView();
+    } else if (stepNumber === 7) {
+        document.getElementById("compliance-dashboard-view").style.display = "block";
+        renderComplianceDashboardView();
+    }
+}
+
+async function handleStepNavigation(nextStep) {
+    const currentStep = State.currentProjectStep || 1;
+    
+    // Auto-save checklist edits when moving away
+    if (currentStep === 4 && nextStep !== 4) {
+        const proj = State.getActiveProject();
+        if (proj && State.currentUser.role === 'auditor' && !proj.azSubmitted) {
+            await saveAZAssessmentDraft();
+        }
+    } else if (currentStep === 5 && nextStep !== 5) {
+        const proj = State.getActiveProject();
+        if (proj && State.currentUser.role === 'auditor' && !proj.complianceSubmitted) {
+            await saveComplianceQuestionnaireDraft();
+        }
+    }
+    
+    await goToProjectStep(nextStep);
+}
+
+function renderAuditorReviewView() {
+    const proj = State.getActiveProject();
+    if (!proj) return;
+    
+    document.getElementById("rev-case-id").textContent = proj.id;
+    const statusBadge = document.getElementById("rev-status-badge");
+    if (statusBadge) {
+        statusBadge.textContent = proj.status;
+        statusBadge.className = "status-badge " + (proj.status === "Reviewed" ? "reviewed" : "submitted");
+    }
+    
+    // Calculate statistics
+    let azCount = 0;
+    AZ_QUESTIONS.forEach(sect => {
+        sect.questions.forEach(q => {
+            const ans = proj.azAnswers[q.id];
+            if (ans && ans.value !== "unanswered") azCount++;
+        });
+    });
+    
+    let compCount = 0;
+    COMPLIANCE_QUESTIONS.forEach(sect => {
+        sect.questions.forEach(q => {
+            const ans = proj.complianceAnswers[q.id];
+            if (ans && ans.value !== "unanswered") compCount++;
+        });
+    });
+    
+    document.getElementById("rev-az-stats").textContent = `${azCount} / 78`;
+    document.getElementById("rev-comp-stats").textContent = `${compCount} / 42`;
+    document.getElementById("rev-docs-count").textContent = (proj.documents || []).length;
+    
+    // Notes
+    const notesEl = document.getElementById("rev-auditor-notes");
+    if (notesEl) {
+        notesEl.value = (proj.auditeeProfile && proj.auditeeProfile.auditorNotes) || "";
+    }
+    
+    // Permissions & Locking
+    const isAuditor = State.currentUser.role === "auditor";
+    const isSubmitted = proj.status === "Reviewed";
+    const notesArea = document.getElementById("rev-auditor-notes");
+    const saveNotesBtn = document.getElementById("btn-save-notes");
+    const genReportBtn = document.getElementById("btn-rev-generate-report");
+    
+    if (notesArea) notesArea.disabled = !isAuditor || isSubmitted;
+    if (saveNotesBtn) saveNotesBtn.disabled = !isAuditor || isSubmitted;
+    if (genReportBtn) genReportBtn.disabled = !isAuditor;
+}
+
+async function saveAuditorNotesDraft() {
+    const proj = State.getActiveProject();
+    if (!proj) return;
+    
+    const notesEl = document.getElementById("rev-auditor-notes");
+    if (!notesEl) return;
+    
+    proj.auditeeProfile = proj.auditeeProfile || {};
+    proj.auditeeProfile.auditorNotes = notesEl.value;
+    
+    showToast("Saving auditor notes...", "info");
+    
+    if (_supabase) {
+        try {
+            const { error } = await _supabase
+                .from('projects')
+                .update({ auditee_profile: proj.auditeeProfile })
+                .eq('id', proj.id);
+            if (error) {
+                console.warn("Supabase notes save failed: " + error.message);
+                showToast("Cloud save failed — saving locally.", "warning");
+            }
+        } catch (err) {
+            console.warn("Supabase notes save error:", err);
+            showToast("Cloud save failed — saving locally.", "warning");
+        }
+    }
+    
+    State.saveState();
+    showToast("Auditor conclusion notes saved.", "success");
+}
+
 function viewProjectDetail(projectId) {
     resetProjectDeleteConfirmation();
     State.activeProjectId = projectId;
+    
+    const proj = State.getActiveProject();
+    if (proj) {
+        if (proj.status === "Reviewed") {
+            State.currentProjectStep = 7;
+        } else if (proj.complianceSubmitted) {
+            State.currentProjectStep = 6;
+        } else if (proj.azSubmitted) {
+            State.currentProjectStep = 5;
+        } else if (proj.status === "Under Assessment") {
+            State.currentProjectStep = 4;
+        } else {
+            State.currentProjectStep = 1;
+        }
+    } else {
+        State.currentProjectStep = 1;
+    }
+    
     State.saveState();
-    navigateTo("project-detail");
+    goToProjectStep(State.currentProjectStep);
 }
-
-// ==========================================================================
-// 10. PROJECT DETAIL VIEW
-// ==========================================================================
 
 function renderProjectDetailView() {
     const proj = State.getActiveProject();
@@ -2334,34 +2563,35 @@ function renderProjectDetailView() {
 
     // Render auditee profile summary
     const profileBox = document.getElementById("det-auditee-profile");
+    const profileData = proj.auditeeProfile || {};
     profileBox.innerHTML = `
         <div class="profile-summary-item">
             <span style="color:var(--text-secondary);">Designation</span>
-            <span style="font-weight:600;">${proj.auditeeProfile.designation}</span>
+            <span style="font-weight:600;">${profileData.designation || 'N/A'}</span>
         </div>
         <div class="profile-summary-item">
             <span style="color:var(--text-secondary);">Professional Experience</span>
-            <span style="font-weight:600;">${proj.auditeeProfile.profExp} Years</span>
+            <span style="font-weight:600;">${profileData.profExp || '0'} Years</span>
         </div>
         <div class="profile-summary-item">
             <span style="color:var(--text-secondary);">AI/ML Experience</span>
-            <span style="font-weight:600;">${proj.auditeeProfile.aiExp} Years</span>
+            <span style="font-weight:600;">${profileData.aiExp || '0'} Years</span>
         </div>
         <div class="profile-summary-item" style="flex-direction:column; align-items:flex-start; gap:0.25rem;">
             <span style="color:var(--text-secondary);">Certifications</span>
-            <span style="font-weight:600; font-size:0.85rem; line-height:1.3;">${proj.auditeeProfile.certs}</span>
+            <span style="font-weight:600; font-size:0.85rem; line-height:1.3;">${profileData.certs || 'None'}</span>
         </div>
     `;
 
-// Render documents list
+    // Render documents list
     const docsBox = document.getElementById("det-uploaded-docs");
-    if (proj.documents.length === 0) {
+    if (!proj.documents || proj.documents.length === 0) {
         docsBox.innerHTML = `<p style="color:var(--text-muted); font-size:0.85rem; text-align:center; padding-top:2rem;">No documents uploaded.</p>`;
     } else {
         let docsHtml = "";
         proj.documents.forEach((doc, idx) => {
             docsHtml += `
-                <div class="document-item">
+                <div class="document-item" style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); margin-bottom: 0.5rem; border-radius: var(--radius-sm);">
                     <div style="display:flex; flex-direction:column; gap:0.15rem;">
                         <span style="font-weight:600; font-size:0.85rem; color:var(--text-primary);">${doc.name}</span>
                         <span style="font-size:0.75rem; color:var(--text-muted);">${doc.framework} | ${doc.size}</span>
@@ -2373,44 +2603,40 @@ function renderProjectDetailView() {
         docsBox.innerHTML = docsHtml;
     }
 
-    // Render action buttons
+    // Configure the upload controls container based on user role
+    const isAuditee = State.currentUser.role === "auditee";
+    const uploadContainer = document.getElementById("detail-upload-container");
+    if (uploadContainer) {
+        uploadContainer.style.display = isAuditee ? "block" : "none";
+    }
+
+    // Action buttons inside Step 3
     const actionsBox = document.getElementById("det-actions-container");
-    
-    if (State.currentUser.role === "auditor") {
-        if (proj.status.includes("Submitted") || proj.status === "Under Assessment") {
-            actionsBox.innerHTML = `
-                <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
-                <button class="btn btn-primary" onclick="startOrContinueAssessment()">Next (Start Assessment)</button>
-            `;
+    if (actionsBox) {
+        if (State.currentUser.role === "auditee") {
+            if (proj.status === "Reviewed" || proj.azSubmitted || proj.complianceSubmitted) {
+                actionsBox.innerHTML = `
+                    <button class="btn btn-secondary btn-sm" disabled style="opacity:0.5; cursor:not-allowed;">Submission Locked</button>
+                `;
+            } else if (proj.auditeeEmail === State.currentUser.email) {
+                const isDeleteArmed = deleteConfirmationProjectId === proj.id;
+                actionsBox.innerHTML = `
+                    <button class="btn btn-danger btn-sm" onclick="handleProjectDeleteRequest('${proj.id}')">${isDeleteArmed ? 'Click again to delete' : 'Delete Project'}</button>
+                `;
+            } else {
+                actionsBox.innerHTML = '';
+            }
         } else {
-            actionsBox.innerHTML = `
-                <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
-                <button class="btn btn-primary" onclick="navigateTo('compliance-dashboard')">View Compliance Dashboard</button>
-            `;
-        }
-    } else {
-        // Auditee Action Buttons
-        if (proj.status === "Reviewed" || proj.azSubmitted || proj.complianceSubmitted) {
-            actionsBox.innerHTML = `
-                <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
-                <button class="btn btn-primary" onclick="navigateTo('compliance-dashboard')">View Compliance Dashboard</button>
-            `;
-        } else if (proj.auditeeEmail === State.currentUser.email) {
-            const isDeleteArmed = deleteConfirmationProjectId === proj.id;
-            actionsBox.innerHTML = `
-                <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
-                <button class="btn btn-danger" onclick="handleProjectDeleteRequest('${proj.id}')">${isDeleteArmed ? 'Click again to delete forever' : 'Delete Project'}</button>
-                <div style="font-size:0.8rem; color:${isDeleteArmed ? 'var(--danger)' : 'var(--text-muted)'}; line-height:1.4; max-width: 320px;">
-                    ${isDeleteArmed ? 'Final click will permanently remove this project from your auditee workspace.' : 'Deletion is only available to the linked auditee and requires a second confirmation click.'}
-                </div>
-            `;
-        } else {
-            actionsBox.innerHTML = `
-                <button class="btn btn-secondary" onclick="navigateTo('ongoing-projects')">Back to List</button>
-                <div style="font-size:0.85rem; color:var(--warning); font-weight:500; display:flex; align-items:center;">
-                    ⏱️ Under assessment review by Lead Auditor.
-                </div>
-            `;
+            // Auditor action buttons inside Documents tab
+            if (proj.status.includes("Submitted") || proj.status === "Under Assessment") {
+                actionsBox.innerHTML = `
+                    <button class="btn btn-primary btn-sm" onclick="startOrContinueAssessment()">Claim & Continue Assessment</button>
+                `;
+            } else {
+                actionsBox.innerHTML = `
+                    <button class="btn btn-secondary btn-sm" onclick="navigateTo('ongoing-projects')">Back to List</button>
+                `;
+            }
         }
     }
 }
@@ -2544,21 +2770,27 @@ async function startOrContinueAssessment() {
         proj.auditorEmail = State.currentUser.email;
         
         showToast("Claiming project in database...", "info");
-        await _supabase
-            .from('projects')
-            .update({ 
-                status: "Under Assessment", 
-                auditor_email: State.currentUser.email 
-            })
-            .eq('id', proj.id);
-            
+        if (_supabase) {
+            try {
+                await _supabase
+                    .from('projects')
+                    .update({ 
+                        status: "Under Assessment", 
+                        auditor_email: State.currentUser.email 
+                    })
+                    .eq('id', proj.id);
+            } catch (err) {
+                console.error("Failed to claim project in database:", err);
+                showToast("Cloud save failed — saving locally.", "warning");
+            }
+        }
         State.saveState();
     }
     
     if (!proj.azSubmitted) {
-        navigateTo("az-assessment");
+        await handleStepNavigation(4);
     } else {
-        navigateTo("compliance-questionnaire");
+        await handleStepNavigation(5);
     }
 }
 
@@ -2608,6 +2840,14 @@ function renderAZAssessmentView() {
     });
     
     sheet.innerHTML = sectionsHtml;
+
+    const isAuditor = State.currentUser.role === "auditor";
+    const isAzSubmitted = proj.azSubmitted;
+    
+    const saveBtn = document.getElementById("btn-az-save-draft");
+    const submitBtn = document.getElementById("btn-az-submit");
+    if (saveBtn) saveBtn.disabled = !isAuditor || isAzSubmitted;
+    if (submitBtn) submitBtn.disabled = !isAuditor || isAzSubmitted;
 }
 
 function markQuestionDirty(qId) {
@@ -2619,7 +2859,7 @@ async function saveAZAssessmentDraft() {
     const proj = State.getActiveProject();
     if (!proj) return;
     
-    showToast("Saving draft answers to _supabase...", "info");
+    showToast("Saving draft answers...", "info");
     
     const updates = [];
     AZ_QUESTIONS.forEach(section => {
@@ -2641,13 +2881,18 @@ async function saveAZAssessmentDraft() {
         });
     });
     
-    if (updates.length > 0) {
-        const { error } = await _supabase
-            .from('responses')
-            .upsert(updates, { onConflict: 'project_id,question_id' });
-        if (error) {
-            showToast("Draft save failed: " + error.message, "error");
-            return;
+    if (updates.length > 0 && _supabase) {
+        try {
+            const { error } = await _supabase
+                .from('responses')
+                .upsert(updates, { onConflict: 'project_id,question_id' });
+            if (error) {
+                console.warn("Supabase save failed: " + error.message);
+                showToast("Cloud save failed — saving locally.", "warning");
+            }
+        } catch (err) {
+            console.warn("Supabase save error:", err);
+            showToast("Cloud save failed — saving locally.", "warning");
         }
     }
     
@@ -2762,6 +3007,14 @@ function renderComplianceQuestionnaireView() {
     });
     
     sheet.innerHTML = sectionsHtml;
+
+    const isAuditor = State.currentUser.role === "auditor";
+    const isCompSubmitted = proj.complianceSubmitted;
+    
+    const saveBtn = document.getElementById("btn-comp-save-draft");
+    const submitBtn = document.getElementById("btn-comp-submit");
+    if (saveBtn) saveBtn.disabled = !isAuditor || isCompSubmitted;
+    if (submitBtn) submitBtn.disabled = !isAuditor || isCompSubmitted;
 }
 
 // Save Compliance answers as draft
@@ -2791,13 +3044,18 @@ async function saveComplianceQuestionnaireDraft() {
         });
     });
     
-    if (updates.length > 0) {
-        const { error } = await _supabase
-            .from('responses')
-            .upsert(updates, { onConflict: 'project_id,question_id' });
-        if (error) {
-            showToast("Draft save failed: " + error.message, "error");
-            return;
+    if (updates.length > 0 && _supabase) {
+        try {
+            const { error } = await _supabase
+                .from('responses')
+                .upsert(updates, { onConflict: 'project_id,question_id' });
+            if (error) {
+                console.warn("Supabase compliance save failed: " + error.message);
+                showToast("Cloud save failed — saving locally.", "warning");
+            }
+        } catch (err) {
+            console.warn("Supabase compliance save error:", err);
+            showToast("Cloud save failed — saving locally.", "warning");
         }
     }
     
@@ -2914,26 +3172,6 @@ function submitComplianceQuestionnaire() {
         modal.style.display = "none";
         
         showToast("AI Compliance framework assessment finalized.", "success");
-        
-        // Create notification for the Auditee that assessment is complete
-        const notifId = String(Math.floor(10000 + Math.random() * 90000));
-        const notif = {
-            id: notifId,
-            project_id: proj.id,
-            project_title: proj.title,
-            sender_email: State.currentUser.email,
-            sender_name: State.currentUser.fullname,
-            receiver_email: proj.auditeeEmail,
-            message: `AI Compliance Framework Assessment for ${proj.title} has been finalized by ${State.currentUser.fullname}.`,
-            type: "general",
-            status: "unread",
-            timestamp: new Date().toISOString().substring(0, 16).replace('T', ' ')
-        };
-        if (_supabase) {
-            const { error: notifErr } = await _supabase.from('notifications').insert([notif]);
-            if (notifErr) console.warn("Supabase notification insert failed: " + notifErr.message);
-        }
-
         navigateTo("compliance-dashboard");
     };
 
@@ -3639,16 +3877,33 @@ The project is on track but requires the execution of the remediation roadmap to
     }
 }
 
-function revisitAssessmentFlow() {
+async function revisitAssessmentFlow() {
     const proj = State.getActiveProject();
+    if (!proj) return;
+
     // Re-enable editing by unlocking submitted flags temporarily
     proj.azSubmitted = true; 
     proj.complianceSubmitted = false; 
     proj.status = "Under Assessment";
+    
+    if (_supabase) {
+        try {
+            await _supabase
+                .from('projects')
+                .update({
+                    status: "Under Assessment",
+                    compliance_submitted: false
+                })
+                .eq('id', proj.id);
+        } catch (err) {
+            console.error("Failed to update status in Supabase:", err);
+        }
+    }
+    
     State.saveState();
     
     showToast("Assessment unlocked. Resuming compliance questionnaire edits.", "info");
-    navigateTo("compliance-questionnaire");
+    await handleStepNavigation(5);
 }
 
 // ==========================================================================
@@ -3774,7 +4029,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     // Always start on the auth screen — never trust localStorage user alone.
     // Supabase INITIAL_SESSION event will restore a real session automatically.
     // If Supabase is unavailable, we stay on auth screen (security first).
-    injectSimulatorWidget();
     showView("auth-section");
     
     await initSupabase();
@@ -3787,513 +4041,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     
 });
-
-// Walkthrough Simulator Injection
-function injectSimulatorWidget() {
-    if (document.getElementById("ey-simulator-widget")) return;
-
-    // Create widget container
-    const widget = document.createElement("div");
-    widget.id = "ey-simulator-widget";
-    widget.style.cssText = `
-        position: fixed;
-        bottom: 20px;
-        left: 20px;
-        z-index: 10000;
-        background: rgba(20, 20, 20, 0.95);
-        border: 1px solid var(--primary);
-        box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-        border-radius: var(--radius-lg);
-        color: var(--text-primary);
-        font-family: var(--font-sans);
-        width: 320px;
-        overflow: hidden;
-        transition: var(--transition-smooth);
-        backdrop-filter: blur(10px);
-    `;
-
-    // Inner HTML
-    widget.innerHTML = `
-        <div id="ey-sim-header" style="background:var(--primary); color:#000; padding:10px 15px; font-weight:700; font-size:0.85rem; display:flex; justify-content:space-between; align-items:center; cursor:pointer;">
-            <span>🛡️ EY WALKTHROUGH SIMULATOR</span>
-            <span id="ey-sim-toggle-btn">▼</span>
-        </div>
-        <div id="ey-sim-body" style="padding:15px; display:flex; flex-direction:column; gap:10px; max-height:400px; overflow-y:auto; overflow:hidden; opacity:1; transition:max-height 220ms ease, opacity 180ms ease, padding 180ms ease;">
-            <p style="font-size:0.75rem; color:var(--text-secondary); margin:0; line-height:1.4;">
-                Select a scenario step to automatically configure the platform state and warp to that screen.
-            </p>
-            
-            <button class="btn btn-secondary btn-sm" onclick="simReset()" style="background:rgba(255,255,255,0.05); color:#fff; border-color:var(--border-color);">
-                🔄 Reset to Clean Slate
-            </button>
-            
-            <div style="border-top:1px solid var(--border-color); padding-top:8px; margin-top:5px;">
-                <span style="font-size:0.7rem; color:var(--primary); font-weight:700; text-transform:uppercase;">(Auditee) Flow</span>
-                <div style="display:flex; flex-direction:column; gap:6px; margin-top:5px;">
-                    <button class="btn btn-primary btn-sm" onclick="simArjunDraft()" style="background:rgba(255,230,0,0.1); color:var(--primary);">
-                        1. Resume Draft (Case 84721)
-                    </button>
-                    <button class="btn btn-primary btn-sm" onclick="simArjunSubmitted()" style="background:rgba(255,230,0,0.1); color:var(--primary);">
-                        2. Submit Project (Case 84721)
-                    </button>
-                </div>
-            </div>
-            
-            <div style="border-top:1px solid var(--border-color); padding-top:8px; margin-top:5px;">
-                <span style="font-size:0.7rem; color:var(--success); font-weight:700; text-transform:uppercase;">(Auditor) Flow</span>
-                <div style="display:flex; flex-direction:column; gap:6px; margin-top:5px;">
-                    <button class="btn btn-success btn-sm" onclick="simRameshStart()" style="background:rgba(16,185,129,0.1); color:var(--success); border-color:var(--success-glow);">
-                        3. Start A-Z Assessment
-                    </button>
-                    <button class="btn btn-success btn-sm" onclick="simRameshMidway()" style="background:rgba(16,185,129,0.1); color:var(--success); border-color:var(--success-glow);">
-                        4. Compliance Questionnaire Draft
-                    </button>
-                    <button class="btn btn-success btn-sm" onclick="simRameshFinal()" style="background:rgba(16,185,129,0.1); color:var(--success); border-color:var(--success-glow);">
-                        5. Final Dashboard (74, 28, 18)
-                    </button>
-                </div>
-            </div>
-
-            <!-- Debug projects database section -->
-            <div style="border-top:1px solid var(--border-color); padding-top:8px; margin-top:5px;">
-                <span style="font-size:0.7rem; color:#fff; font-weight:700; text-transform:uppercase;">Debug Projects Database</span>
-                <div id="debug-project-list" style="font-size:0.65rem; color:var(--text-secondary); margin-top:5px; max-height:150px; overflow-y:auto; background:rgba(0,0,0,0.3); padding:5px; border-radius:4px; border:1px solid rgba(255,255,255,0.05);">
-                </div>
-            </div>
-        </div>
-    `;
-
-    document.body.appendChild(widget);
-
-    // Collapsible widget logic
-    const header = document.getElementById("ey-sim-header");
-    const body = document.getElementById("ey-sim-body");
-    const toggleBtn = document.getElementById("ey-sim-toggle-btn");
-    
-    let isCollapsed = false;
-    
-    // Start expanded by default for easier walkthrough access
-    body.style.display = "flex";
-    body.style.maxHeight = "400px";
-    body.style.opacity = "1";
-    toggleBtn.textContent = "▼";
-    isCollapsed = false;
-
-    const setCollapsedState = (collapsed) => {
-        isCollapsed = collapsed;
-        body.style.maxHeight = collapsed ? "0px" : "400px";
-        body.style.opacity = collapsed ? "0" : "1";
-        body.style.paddingTop = collapsed ? "0px" : "15px";
-        body.style.paddingBottom = collapsed ? "0px" : "15px";
-        body.style.pointerEvents = collapsed ? "none" : "auto";
-        toggleBtn.textContent = collapsed ? "▲" : "▼";
-        if (!collapsed) updateDebugProjList();
-    };
-
-    // Make the entire header clickable (not just the tiny ▼ button)
-    header.onclick = () => {
-        setCollapsedState(!isCollapsed);
-    };
-}
-
-// SIMULATOR ACTIONS
-
-function simReset() {
-    safeStorage.clear();
-    window.location.reload();
-}
-
-function simArjunDraft() {
-    safeStorage.clear();
-    
-    // Seed Users
-    safeStorage.setItem("ey_users", JSON.stringify(DEFAULT_USERS));
-    
-    // Set Arjun as current user, not onboarded yet (he is redirected to onboarding profile)
-    const arjun = DEFAULT_USERS.find(u => u.email === "arjun.mehta@govtech.in");
-    arjun.onboarded = false; // let him complete profile in Step 3
-    
-    // Save onboarding draft for Arjun
-    safeStorage.setItem("ey_draft_onb_aee", JSON.stringify({
-        profExp: 14,
-        aiExp: 5,
-        certs: ["PMP", "AWS Certified ML Specialty"],
-        customCert: "" // let him type Google Cloud Professional ML Engineer
-    }));
-    
-    // Save project draft for Step 7 (banner will display)
-    safeStorage.setItem("ey_draft_project", JSON.stringify({
-        id: "84721",
-        title: "AI-Powered Smart City Surveillance & Command Platform",
-        domain: "Safe City",
-        desc: "An integrated AI surveillance and command platform for metropolitan police operations, processing 40,000+ live camera feeds using computer vision-based threat detection, crowd analytics, and autonomous UAV surveillance across 200+ urban intersections.",
-        frameworks: ["EU AI Act", "NIST AI RMF", "DPDP", "MeitY Guidelines", "ISO 42001"],
-        documents: [
-            { name: "AIMS_Policy_v2.pdf", framework: "ISO 42001", size: "2.4 MB", timestamp: "2026-06-12 10:14" },
-            { name: "Risk_Assessment_Report.docx", framework: "EU AI Act", size: "1.8 MB", timestamp: "2026-06-12 10:15" },
-            { name: "AI_Risk_Register_2026.pdf", framework: "NIST AI RMF", size: "3.1 MB", timestamp: "2026-06-12 10:16" }
-        ]
-    }));
-
-    safeStorage.setItem("ey_current_user", JSON.stringify(arjun));
-    safeStorage.setItem("ey_active_view", "onboarding-auditee");
-    window.location.reload();
-}
-
-function simArjunSubmitted() {
-    safeStorage.clear();
-    safeStorage.setItem("ey_users", JSON.stringify(DEFAULT_USERS));
-    
-    // Arjun registered and onboarded
-    const arjun = DEFAULT_USERS.find(u => u.email === "arjun.mehta@govtech.in");
-    arjun.onboarded = true;
-    
-    // Project submitted
-    safeStorage.setItem("ey_projects", JSON.stringify(INITIAL_PROJECTS));
-    
-    safeStorage.setItem("ey_current_user", JSON.stringify(arjun));
-    safeStorage.setItem("ey_active_view", "ongoing-projects");
-    window.location.reload();
-}
-
-function simRameshStart() {
-    safeStorage.clear();
-    
-    // Ramesh is registered but not onboarded (force onboarding questionnaire)
-    const ramesh = DEFAULT_USERS.find(u => u.email === "ramesh.k@ey.com");
-    ramesh.onboarded = false;
-    
-    // Save onboarding draft for Ramesh
-    safeStorage.setItem("ey_draft_onb_aud", JSON.stringify({
-        role: "Lead Auditor",
-        years: 6,
-        certs: ["ISO 42001 Lead Auditor", "CISA"] // CISSP will be checked manually
-    }));
-    
-    safeStorage.setItem("ey_users", JSON.stringify(DEFAULT_USERS));
-    safeStorage.setItem("ey_projects", JSON.stringify(INITIAL_PROJECTS));
-    
-    safeStorage.setItem("ey_current_user", JSON.stringify(ramesh));
-    safeStorage.setItem("ey_active_view", "onboarding-auditor");
-    window.location.reload();
-}
-
-function simRameshMidway() {
-    safeStorage.clear();
-    safeStorage.setItem("ey_users", JSON.stringify(DEFAULT_USERS));
-    
-    const ramesh = DEFAULT_USERS.find(u => u.email === "ramesh.k@ey.com");
-    ramesh.onboarded = true;
-    
-    // Create pre-filled project with A-Z midway answers
-    const proj = JSON.parse(JSON.stringify(INITIAL_PROJECTS[0]));
-    
-    // Answer Section C Q1 Fail, Q2 Unanswered
-    proj.azAnswers["AZ-C-1"] = { value: "fail", comment: "Design document specifies AES-128; AES-256 required. Immediate remediation needed." };
-    proj.azAnswers["AZ-C-2"] = { value: "unanswered", comment: "TLS version not specified in submitted documentation. Clarification required from auditee." };
-    
-    // Section P is Pass
-    proj.azAnswers["AZ-P-1"] = { value: "pass", comment: "Dynamic face-masking confirmed in design document." };
-    proj.azAnswers["AZ-P-2"] = { value: "pass", comment: "Datasets pseudonymized." };
-    proj.azAnswers["AZ-P-3"] = { value: "pass", comment: "Access strictly restricted." };
-    
-    // Section G is N/A
-    proj.azAnswers["AZ-G-1"] = { value: "na", comment: "Not Applicable - ground-based command system only." };
-    proj.azAnswers["AZ-G-2"] = { value: "na", comment: "Not Applicable - ground-based command system only." };
-    proj.azAnswers["AZ-G-3"] = { value: "na", comment: "Not Applicable - ground-based command system only." };
-    
-    // Other A-Z answers filled to satisfy 74 answered / 4 unanswered
-    AZ_QUESTIONS.forEach(section => {
-        section.questions.forEach(q => {
-            if (!proj.azAnswers[q.id]) {
-                // Default others to Pass
-                proj.azAnswers[q.id] = { value: "pass", comment: "Verified." };
-            }
-        });
-    });
-    
-    // Overwrite the specific ones to make exactly 4 unanswered in A-Z:
-    proj.azAnswers["AZ-C-2"] = { value: "unanswered", comment: "TLS version not specified in submitted documentation. Clarification required from auditee." };
-    proj.azAnswers["AZ-C-3"] = { value: "unanswered", comment: "Vulnerability scan reports missing." };
-    proj.azAnswers["AZ-E-2"] = { value: "unanswered", comment: "Saliency maps not provided." };
-    proj.azAnswers["AZ-E-3"] = { value: "unanswered", comment: "Explainability model documentation pending." };
-    
-    // Let's count answered: 78 - 4 = 74 answered!
-    // Since A-Z is submitted:
-    proj.azSubmitted = true;
-    proj.status = "Under Assessment";
-    
-    // Now, save Compliance draft for Sections 1, 2, 5 (EU AI Act: 9, NIST: 9, ISO 42001: 8 -> 26 questions answered)
-    // Plus DPDP Q3: Unanswered (1)
-    // The rest of DPDP (7) and MeitY (8) are unanswered (15 unanswered).
-    // Let's seed complianceAnswers:
-    // Section 1: EU AI Act (9 questions)
-    proj.complianceAnswers["COMP-EU-1"] = { value: "pass", comment: "Classified as High-Risk under Annex III. Confirmed in Risk Assessment Report." };
-    for (let i = 2; i <= 9; i++) {
-        proj.complianceAnswers[`COMP-EU-${i}`] = { value: "pass", comment: "Compliant." };
-    }
-    
-    // Section 2: NIST (9 questions)
-    for (let i = 1; i <= 9; i++) {
-        proj.complianceAnswers[`COMP-NST-${i}`] = { value: "pass", comment: "Risk managed." };
-    }
-    
-    // Section 5: ISO 42001 (8 questions)
-    for (let i = 1; i <= 8; i++) {
-        proj.complianceAnswers[`COMP-ISO-${i}`] = { value: "pass", comment: "AIMS implemented." };
-    }
-    
-    // Section 3: DPDP (8 questions)
-    proj.complianceAnswers["COMP-DP-3"] = { value: "unanswered", comment: "No evidence of data subject rights implementation found in submitted documents." };
-    
-    // Total compliance answered = 9 (EU) + 9 (NIST) + 8 (ISO) = 26 questions answered (saved to draft).
-    // Unanswered = 1 (DPDP Q3 answered as 'unanswered') + 7 (other DPDP) + 8 (MeitY) = 16 unanswered.
-    // Combined A-Z (4 unanswered) + Compliance (16 unanswered) = 20 unanswered?
-    // Wait, we need:
-    // - Submitted: 74 (which is exactly the 74 answered in A-Z)
-    // - Saved to Draft: 28 (which is the answered in Compliance).
-    //   Wait, 28 answered in Compliance!
-    //   If we answer:
-    //   - EU AI Act (9 answered)
-    //   - NIST (9 answered)
-    //   - ISO 42001 (8 answered)
-    //   - Plus 2 more answered in DPDP or MeitY (e.g. DP-1, DP-2) = 28 answered in Compliance!
-    //   Let's check: 9 + 9 + 8 + 2 = 28 answered.
-    //   So if we answer DP-1 and DP-2 as Pass, and DP-3 as 'unanswered' (which is unanswered),
-    //   then we have 28 answered (Saved to Draft) and 14 unanswered in Compliance.
-    //   Let's do that!
-    proj.complianceAnswers["COMP-DP-1"] = { value: "pass", comment: "Lawful processing." };
-    proj.complianceAnswers["COMP-DP-2"] = { value: "pass", comment: "Consent obtained." };
-    
-    safeStorage.setItem("ey_projects", JSON.stringify([proj]));
-    safeStorage.setItem("ey_current_user", JSON.stringify(ramesh));
-    safeStorage.setItem("ey_active_view", "compliance-questionnaire");
-    safeStorage.setItem("ey_active_project_id", "84721");
-    window.location.reload();
-}
-
-function simRameshFinal() {
-    safeStorage.clear();
-    safeStorage.setItem("ey_users", JSON.stringify(DEFAULT_USERS));
-    
-    const ramesh = DEFAULT_USERS.find(u => u.email === "ramesh.k@ey.com");
-    ramesh.onboarded = true;
-    
-    // Create pre-filled project with A-Z and Compliance fully submitted
-    const proj = JSON.parse(JSON.stringify(INITIAL_PROJECTS[0]));
-    
-    // A-Z Answers (74 answered, 4 unanswered)
-    AZ_QUESTIONS.forEach(section => {
-        section.questions.forEach(q => {
-            proj.azAnswers[q.id] = { value: "pass", comment: "Verified compliant." };
-        });
-    });
-    // Set specific A-Z answers
-    proj.azAnswers["AZ-C-1"] = { value: "fail", comment: "Design document specifies AES-128; AES-256 required. Immediate remediation needed." };
-    proj.azAnswers["AZ-C-2"] = { value: "unanswered", comment: "TLS version not specified in submitted documentation. Clarification required from auditee." };
-    proj.azAnswers["AZ-C-3"] = { value: "unanswered", comment: "Vulnerability scan reports missing." };
-    proj.azAnswers["AZ-E-2"] = { value: "unanswered", comment: "Saliency maps not provided." };
-    proj.azAnswers["AZ-E-3"] = { value: "unanswered", comment: "Explainability model documentation pending." };
-    
-    proj.azAnswers["AZ-P-1"] = { value: "pass", comment: "Dynamic face-masking confirmed in design document." };
-    proj.azAnswers["AZ-G-1"] = { value: "na", comment: "Not Applicable - ground-based command system only." };
-    proj.azAnswers["AZ-G-2"] = { value: "na", comment: "Not Applicable - ground-based command system only." };
-    proj.azAnswers["AZ-G-3"] = { value: "na", comment: "Not Applicable - ground-based command system only." };
-    
-    proj.azSubmitted = true;
-    
-    // Compliance Answers (28 answered, 14 unanswered)
-    // Fills EU AI Act (9 answered)
-    for (let i = 1; i <= 9; i++) {
-        proj.complianceAnswers[`COMP-EU-${i}`] = { value: "pass", comment: "Compliant." };
-    }
-    proj.complianceAnswers["COMP-EU-1"] = { value: "pass", comment: "Classified as High-Risk under Annex III. Confirmed in Risk Assessment Report." };
-    
-    // NIST (9 answered)
-    for (let i = 1; i <= 9; i++) {
-        proj.complianceAnswers[`COMP-NST-${i}`] = { value: "pass", comment: "Compliant." };
-    }
-    
-    // ISO 42001 (8 answered)
-    for (let i = 1; i <= 8; i++) {
-        proj.complianceAnswers[`COMP-ISO-${i}`] = { value: "pass", comment: "Compliant." };
-    }
-    
-    // DPDP (2 answered)
-    proj.complianceAnswers["COMP-DP-1"] = { value: "pass", comment: "Lawful processing." };
-    proj.complianceAnswers["COMP-DP-2"] = { value: "pass", comment: "Consent obtained." };
-    proj.complianceAnswers["COMP-DP-3"] = { value: "unanswered", comment: "No evidence of data subject rights implementation found in submitted documents." };
-    
-    // Compliance is submitted
-    proj.complianceSubmitted = true;
-    proj.status = "Reviewed";
-    
-    safeStorage.setItem("ey_projects", JSON.stringify([proj]));
-    safeStorage.setItem("ey_current_user", JSON.stringify(ramesh));
-    safeStorage.setItem("ey_active_view", "compliance-dashboard");
-    safeStorage.setItem("ey_active_project_id", "84721");
-    window.location.reload();
-}
-
-function updateDebugProjList() {
-    const box = document.getElementById("debug-project-list");
-    if (!box) return;
-    if (!State.projects || State.projects.length === 0) {
-        box.textContent = "No projects in database.";
-        return;
-    }
-    let html = "";
-    State.projects.forEach(p => {
-        html += `<div style="margin-bottom:6px; border-bottom:1px dashed rgba(255,255,255,0.1); padding-bottom:4px; line-height:1.3;">
-            ID: <b>${p.id}</b><br>
-            Title: ${p.title ? p.title.substring(0, 25) + '...' : 'Untitled'}<br>
-            Auditee: ${p.auditeeEmail || 'None'}<br>
-            Auditor: ${p.auditorEmail || 'unassigned'}<br>
-            Status: ${p.status}
-        </div>`;
-    });
-    box.innerHTML = html;
-}
-
-// Notification Center Logic
-function renderNotifications() {
-    const listEl = document.getElementById("notification-list");
-    const badgeEl = document.getElementById("notification-badge");
-    if (!listEl || !badgeEl || !State.currentUser) return;
-    
-    const userNotifications = State.notifications.filter(n => n.receiverEmail === State.currentUser.email);
-    const unreadCount = userNotifications.filter(n => n.status === "unread" || n.status === "pending").length;
-    
-    if (unreadCount > 0) {
-        badgeEl.textContent = unreadCount;
-        badgeEl.style.display = "inline-block";
-    } else {
-        badgeEl.style.display = "none";
-    }
-    
-    if (userNotifications.length === 0) {
-        listEl.innerHTML = `<div style="color: var(--text-muted); text-align: center; padding: 1.5rem 0;">No notifications</div>`;
-        return;
-    }
-    
-    let html = "";
-    userNotifications.forEach(n => {
-        const isUnread = n.status === "unread" || n.status === "pending";
-        const bg = isUnread ? "rgba(255, 230, 0, 0.05)" : "transparent";
-        const border = isUnread ? "1px solid var(--primary-glow)" : "1px solid rgba(255,255,255,0.05)";
-        
-        html += `
-            <div style="padding: 0.6rem; background: ${bg}; border: ${border}; border-radius: 6px; display: flex; flex-direction: column; gap: 0.25rem; cursor: default;">
-                <div style="font-weight: 600; color: var(--text-primary); line-height: 1.3;">${n.message}</div>
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.2rem;">
-                    <span style="font-size: 0.65rem; color: var(--text-secondary);">${n.timestamp}</span>
-                    ${n.type === "document_request" && n.status === "pending" && State.currentUser.role === "auditee" ? `
-                        <button class="btn btn-primary btn-xs" onclick="uploadForRequest('${n.projectId}', '${n.id}')" style="padding: 0.15rem 0.35rem; font-size: 0.65rem; height: auto;">Upload</button>
-                    ` : ""}
-                </div>
-            </div>
-        `;
-    });
-    listEl.innerHTML = html;
-}
-
-function toggleNotificationPanel(event) {
-    if (event) event.stopPropagation();
-    const panel = document.getElementById("notification-panel");
-    if (!panel) return;
-    const isShowing = panel.style.display === "block";
-    panel.style.display = isShowing ? "none" : "block";
-    if (!isShowing) {
-        renderNotifications();
-    }
-}
-
-async function markAllNotificationsRead(event) {
-    if (event) event.stopPropagation();
-    if (!State.currentUser) return;
-    
-    const { error } = await _supabase
-        .from('notifications')
-        .delete()
-        .eq('receiver_email', State.currentUser.email);
-        
-    if (error) {
-        showToast("Failed to clear notifications: " + error.message, "error");
-        return;
-    }
-    
-    State.notifications = [];
-    State.saveState();
-    renderNotifications();
-    showToast("Notifications cleared.", "success");
-    
-    const panel = document.getElementById("notification-panel");
-    if (panel) panel.style.display = "none";
-}
-
-function uploadForRequest(projectId, notificationId) {
-    State.activeProjectId = projectId;
-    State.saveState();
-    navigateTo("project-detail");
-    const panel = document.getElementById("notification-panel");
-    if (panel) panel.style.display = "none";
-}
-
-// Document Request Modal & Action Creators
-function openRequestDocumentsModal() {
-    const proj = State.getActiveProject();
-    if (!proj) return;
-    const msg = prompt(`Request additional evidence documents for "${proj.title}":`, `Please upload additional security logs and explainability mappings.`);
-    if (msg === null) return; // user cancelled
-    if (!msg.trim()) {
-        showToast("Request message cannot be empty.", "error");
-        return;
-    }
-    requestDocuments(proj.id, msg.trim());
-}
-
-async function requestDocuments(projectId, message) {
-    const proj = State.projects.find(p => p.id === projectId);
-    if (!proj) return;
-    
-    const notifId = String(Math.floor(10000 + Math.random() * 90000));
-    
-    // Add document request notification to _supabase
-    const { error } = await _supabase.from('notifications').insert([{
-        id: notifId,
-        project_id: proj.id,
-        project_title: proj.title,
-        sender_email: State.currentUser.email,
-        sender_name: State.currentUser.fullname,
-        receiver_email: proj.auditeeEmail,
-        message: `${State.currentUser.fullname} requested documents: "${message}"`,
-        type: "document_request",
-        status: "pending",
-        timestamp: new Date().toISOString().substring(0, 16).replace('T', ' ')
-    }]);
-
-    if (error) {
-        showToast("Failed to send request: " + error.message, "error");
-        return;
-    }
-    
-    State.notifications.unshift({
-        id: notifId,
-        projectId: proj.id,
-        projectTitle: proj.title,
-        senderEmail: State.currentUser.email,
-        senderName: State.currentUser.fullname,
-        receiverEmail: proj.auditeeEmail,
-        message: `${State.currentUser.fullname} requested documents: "${message}"`,
-        type: "document_request",
-        status: "pending",
-        timestamp: new Date().toISOString().substring(0, 16).replace('T', ' ')
-    });
-    
-    State.saveState();
-    showToast("Document request sent successfully.", "success");
-    renderRoute();
-}
 
 // Project Details File Uploads
 let detailSelectedFile = null;
@@ -4372,33 +4119,6 @@ async function uploadDocumentToActiveProject() {
         });
         State.saveState();
     }
-    
-    // Resolve pending requests for this project
-    await _supabase
-        .from('notifications')
-        .update({ status: 'resolved' })
-        .eq('project_id', proj.id)
-        .eq('receiver_email', State.currentUser.email)
-        .eq('type', 'document_request')
-        .eq('status', 'pending');
-    
-    // Notify the auditor (if assigned)
-    if (proj.auditorEmail) {
-        const notifId = String(Math.floor(10000 + Math.random() * 90000));
-        await _supabase.from('notifications').insert([{
-            id: notifId,
-            project_id: proj.id,
-            project_title: proj.title,
-            sender_email: State.currentUser.email,
-            sender_name: State.currentUser.fullname,
-            receiver_email: proj.auditorEmail,
-            message: `${State.currentUser.fullname} has uploaded requested documents for: ${proj.title}`,
-            type: "general",
-            status: "unread",
-            timestamp: timestamp
-        }]);
-    }
-    
     showToast(`Successfully uploaded "${detailSelectedFileObject.name}" to project.`, "success");
     
     detailSelectedFile = null;
